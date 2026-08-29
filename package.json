@@ -1,6 +1,6 @@
 {
   "name": "dsh-wo-github",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Workspace Overview GitHub tab: an About card, the repository README rendered as markdown, and the default-branch commit history with per-file patches, all for the workspace's github.com remote.",
   "type": "module",
   "license": "MIT",

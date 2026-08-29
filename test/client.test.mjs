@@ -11,6 +11,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join as pathJoin } from 'node:path'
 import { dirname as pathDirname, resolve as pathResolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -185,14 +189,16 @@ test('host routes: meta + readme + commits + commit, cached, rate limit mapped',
   try {
     const meta = await h.get('/wo-github/meta?repo=o/r')
     assert.equal(meta.status, 200)
-    assert.equal(meta.body.fullName, 'o/r')
-    assert.equal(meta.body.stars, 5)
+    assert.equal(meta.body.github.fullName, 'o/r')
+    assert.equal(meta.body.github.stars, 5)
+    assert.equal(meta.body.local, undefined)
 
     const readme = await h.get('/wo-github/readme?repo=o/r')
     assert.equal(readme.body.text, '# Hello')
 
     const commits = await h.get('/wo-github/commits?repo=o/r')
-    assert.equal(commits.body.count, 1)
+    assert.equal(commits.body.hasMore, false)
+    assert.equal(commits.body.source, 'github')
     assert.equal(commits.body.commits[0].sha, 'a'.repeat(40))
 
     const commit = await h.get('/wo-github/commit?repo=o/r&sha=' + 'b'.repeat(40))
@@ -248,5 +254,110 @@ test('host: absent readme surfaces as { absent: true }, not an error', async () 
     assert.equal(res.body.absent, true)
   } finally {
     h.cleanup()
+  }
+})
+
+// ------------------------------------------------------------------ local git
+
+/** A real tiny clone: two commits, README.md + code file changed in the second. */
+const mkFixtureRepo = () => {
+  const dir = mkdtempSync(pathJoin(tmpdir(), 'wog-'))
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], { env: { ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' } })
+  git('init', '-b', 'main')
+  git('config', 'user.email', 't@t'); git('config', 'user.name', 'T')
+  writeFileSync(pathJoin(dir, 'README.md'), '# Fixture\n\nlocal readme body\n')
+  git('add', '-A'); git('commit', '-m', 'first: add readme')
+  writeFileSync(pathJoin(dir, 'code.js'), 'let a = 1;\n')
+  git('add', '-A'); git('commit', '-m', 'second: add code\n\nbody line')
+  return dir
+}
+
+test('local: locate, readme, commits, commit detail, meta — no network', async () => {
+  const dir = mkFixtureRepo()
+  const h = mkHostHarness()
+  const host = await import(HOST_ENTRY_PATH)
+  host.apply({ webServer: { register: (s) => { h.routes.set(s.path, s.handler); return () => {} } } })
+  h.setFetch(() => { throw new Error('network must not be used for local git data') })
+  try {
+    const enc = encodeURIComponent(dir)
+
+    const locate = await h.get('/wo-github/locate?path=' + enc)
+    assert.equal(locate.body.git, true)
+
+    const readme = await h.get('/wo-github/readme?path=' + enc)
+    assert.equal(readme.body.name, 'README.md')
+    assert.match(readme.body.text, /local readme body/)
+
+    const commits = await h.get('/wo-github/commits?path=' + enc + '&page=1')
+    assert.equal(commits.body.source, 'local')
+    assert.equal(commits.body.commits.length, 2)
+    assert.equal(commits.body.hasMore, false)
+    assert.equal(commits.body.commits[0].message, 'second: add code')
+    const fullSha = commits.body.commits[0].sha
+
+    const detail = await h.get('/wo-github/commit?path=' + enc + '&sha=' + fullSha)
+    assert.equal(detail.body.source, 'local')
+    assert.equal(detail.body.files.length, 1)
+    const file = detail.body.files[0]
+    assert.equal(file.filename, 'code.js')
+    assert.equal(file.status, 'added')
+    assert.equal(file.additions, 1)
+    assert.match(file.patch, /^@@ -0,0 \+1 @@/)
+
+    const meta = await h.get('/wo-github/meta?path=' + enc)
+    assert.equal(meta.body.github, undefined)
+    assert.equal(meta.body.local.branch, 'main')
+    assert.match(meta.body.local.subject, /second: add code/)
+    assert.ok(meta.body.local.lastCommitAt)
+
+    // page far beyond the history: empty, no hasMore
+    const empty = await h.get('/wo-github/commits?path=' + enc + '&page=9')
+    assert.equal(empty.body.commits.length, 0)
+    assert.equal(empty.body.hasMore, false)
+  } finally {
+    h.cleanup()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('local: non-git path falls back to GitHub when a repo is given', async () => {
+  const emptyDir = mkdtempSync(pathJoin(tmpdir(), 'wogempty-'))
+  const h = mkHostHarness()
+  const host = await import(HOST_ENTRY_PATH)
+  host.apply({ webServer: { register: (s) => { h.routes.set(s.path, s.handler); return () => {} } } })
+  h.setFetch((url) => {
+    const u = new URL(url)
+    if (u.pathname === '/repos/o/r') return jsonResponse({ full_name: 'o/r', stargazers_count: 9, forks_count: 0, open_issues_count: 0, subscribers_count: 0, default_branch: 'main', topics: [], owner: { login: 'o' }, html_url: 'u', private: false })
+    return jsonResponse({ message: 'nope' })
+  })
+  try {
+    const locate = await h.get('/wo-github/locate?path=' + encodeURIComponent(emptyDir) + '&repo=o/r')
+    assert.equal(locate.body.git, false)
+    assert.equal(locate.body.slug, 'o/r')
+
+    const meta = await h.get('/wo-github/meta?path=' + encodeURIComponent(emptyDir) + '&repo=o/r')
+    assert.equal(meta.body.github.fullName, 'o/r')
+    assert.equal(meta.body.local, undefined)
+  } finally {
+    h.cleanup()
+    rmSync(emptyDir, { recursive: true, force: true })
+  }
+})
+
+test('local: neither git nor repo -> locate says git:false and client would show empty state', async () => {
+  const emptyDir = mkdtempSync(pathJoin(tmpdir(), 'wognone-'))
+  const h = mkHostHarness()
+  const host = await import(HOST_ENTRY_PATH)
+  host.apply({ webServer: { register: (s) => { h.routes.set(s.path, s.handler); return () => {} } } })
+  h.setFetch(() => { throw new Error('no network expected') })
+  try {
+    const locate = await h.get('/wo-github/locate?path=' + encodeURIComponent(emptyDir))
+    assert.equal(locate.body.git, false)
+    assert.equal(locate.body.slug, null)
+    const readme = await h.get('/wo-github/readme?path=' + encodeURIComponent(emptyDir))
+    assert.equal(readme.body.absent, true)
+  } finally {
+    h.cleanup()
+    rmSync(emptyDir, { recursive: true, force: true })
   }
 })
