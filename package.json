@@ -1,0 +1,30 @@
+{
+  "name": "dsh-wo-github",
+  "version": "0.1.0",
+  "description": "Workspace Overview GitHub tab: an About card, the repository README rendered as markdown, and the default-branch commit history with per-file patches, all for the workspace's github.com remote.",
+  "type": "module",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dependencies": {
+    "dsh-workspace-overview": "link:../dsh-workspace-overview"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}

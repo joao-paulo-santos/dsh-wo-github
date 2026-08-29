@@ -1,0 +1,4 @@
+# dsh-wo-github: GitHub presentation (About, README, commits) for the Workspace Overview tab.
+- insert:
+    - id: wo-github
+      name: dsh-wo-github
