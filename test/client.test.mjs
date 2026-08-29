@@ -361,3 +361,42 @@ test('local: neither git nor repo -> locate says git:false and client would show
     rmSync(emptyDir, { recursive: true, force: true })
   }
 })
+
+test('CommitsPane: hook count is stable across selection (React #300 regression)', async () => {
+  // A fake React that counts hooks executed per render pass.
+  let hookIdx = 0
+  const slots = []
+  const counts = []
+  let counting = false
+  const react = {
+    createElement: (t, p, ...c) => ({ type: t, props: p, children: c.flat(Infinity) }),
+    Fragment: 'F',
+    useState: (init) => {
+      if (counting) counts[counts.length - 1]++
+      const i = hookIdx++
+      if (!(i in slots)) slots[i] = typeof init === 'function' ? init() : init
+      return [slots[i], (v) => { slots[i] = typeof v === 'function' ? v(slots[i]) : v }]
+    },
+    useEffect: () => { if (counting) counts[counts.length - 1]++ },
+  }
+  let mod
+  globalThis.window = { __ModuleLoader__: { load: (h) => { mod = h.factory((s) => s === 'react' ? react : null) } } }
+  globalThis.document = mkDocument()
+  ;(0, eval)(readFileSync(CLIENT_BUNDLE_PATH, 'utf8'))
+  delete globalThis.window
+  mod.apply({ inject: mod.inject, workspaceOverview: { registerTab: () => () => {} }, get: () => undefined, provide: () => {} })
+  const CommitsPane = mod._internal.CommitsPane
+  const loc = { path: '/tmp', repo: undefined }
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ source: 'local', hasMore: false, commits: [{ sha: 'abc1234', message: 'm', author: 'A', date: '2026-01-01T00:00:00Z' }] }) })
+  // pass 1: list view (page + selected + useRepoData's state + its effect)
+  counting = true; counts.push(0); hookIdx = 0
+  CommitsPane({ loc })
+  const beforeSelection = counts[0]
+  assert.equal(beforeSelection, 4, 'page + selected + list state + list effect')
+  // pass 2: a commit is selected — the hook count must not change
+  slots[1] = 'abc1234'
+  counts.push(0); hookIdx = 0
+  CommitsPane({ loc })
+  const afterSelection = counts[1]
+  assert.equal(afterSelection, beforeSelection, 'selection must not change the hook count (early return before hooks = React #300)')
+})
