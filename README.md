@@ -7,12 +7,12 @@ commits, diffs, and the README come from the workspace's own clone.
 
 Three panes:
 
-- **Overview** — the About card: description, topics, stars/watchers/
+- **Overview**: the About card: description, topics, stars/watchers/
   forks/issues, language, license, default branch, homepage, last push.
-- **README** — the repository README rendered as markdown (through
+- **README**: the repository README rendered as markdown (through
   [dsh-md-view](https://github.com/joao-paulo-santos/dsh-md-view)), with
   relative links and images resolved against the repo.
-- **Commits** — the checked-out branch's history, newest first, paginated.
+- **Commits**: the checked-out branch's history, newest first, paginated.
   Picking a commit shows its full message, +/− stats, and every changed
   file as a unified patch with true line numbers; word-level highlights
   come from [dsh-diff-view](https://github.com/joao-paulo-santos/dsh-diff-view)
@@ -25,7 +25,7 @@ place of stars.
 
 ## How it fetches
 
-Local first — the host half runs git in the workspace clone:
+Local first: the host half runs git in the workspace clone:
 
 - Commits come from `git log`, commit diffs from `git show`, the README
   from the committed file (`git show HEAD:README.md`). No rate limits,
@@ -37,7 +37,7 @@ Local first — the host half runs git in the workspace clone:
   `GITHUB_TOKEN` in the harness environment to lift the
   60-requests-per-hour ceiling.
 - API caching: About 5 minutes, commit lists 2 minutes, single commit
-  diffs forever (a sha never changes). Local reads are uncached — git is
+  diffs forever (a sha never changes). Local reads are uncached, since git is
   fast and the data is live by definition.
 - Rate-limit exhaustion surfaces as a clear message in the tab instead of
   a broken pane.
