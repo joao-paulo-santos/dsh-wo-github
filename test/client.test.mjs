@@ -20,6 +20,19 @@ import { fileURLToPath } from 'node:url'
 
 const HERE = pathDirname(fileURLToPath(import.meta.url))
 const CLIENT_BUNDLE_PATH = pathResolve(HERE, '../lib/client.js')
+
+/** Same bucketing as @deepseek-ai/dsh-client-ui-primitives/relative-time. */
+const fakeRelativeTime = (at, now) => {
+  const MIN = 60_000, HOUR = 3_600_000, DAY = 86_400_000
+  const diff = Math.max(0, now - at)
+  if (diff < MIN) return { unit: 'now', n: 0 }
+  if (diff < HOUR) return { unit: 'minutes', n: Math.floor(diff / MIN) }
+  if (diff < DAY) return { unit: 'hours', n: Math.floor(diff / HOUR) }
+  if (diff < 30 * DAY) return { unit: 'days', n: Math.floor(diff / DAY) }
+  if (diff < 365 * DAY) return { unit: 'months', n: Math.floor(diff / (30 * DAY)) }
+  return { unit: 'years', n: Math.floor(diff / (365 * DAY)) }
+}
+const PRIMITIVES_FAKE = { relativeTime: fakeRelativeTime }
 const HOST_ENTRY_PATH = pathResolve(HERE, '../lib/index.js')
 
 // ---------------------------------------------------------------- client
@@ -61,6 +74,7 @@ const loadClient = () => {
   let mod
   globalThis.window = { __ModuleLoader__: { load: (h) => { mod = h.factory((spec) => {
     if (spec === 'react') return react
+    if (spec === '@deepseek-ai/dsh-client-ui-primitives') return PRIMITIVES_FAKE
     throw new Error('unexpected require: ' + spec)
   }) } } }
   globalThis.document = mkDocument()
@@ -380,7 +394,11 @@ test('CommitsPane: hook count is stable across selection (React #300 regression)
     useEffect: () => { if (counting) counts[counts.length - 1]++ },
   }
   let mod
-  globalThis.window = { __ModuleLoader__: { load: (h) => { mod = h.factory((s) => s === 'react' ? react : null) } } }
+  globalThis.window = { __ModuleLoader__: { load: (h) => { mod = h.factory((s) => {
+    if (s === 'react') return react
+    if (s === '@deepseek-ai/dsh-client-ui-primitives') return PRIMITIVES_FAKE
+    throw new Error('unexpected require: ' + s)
+  }) } } }
   globalThis.document = mkDocument()
   ;(0, eval)(readFileSync(CLIENT_BUNDLE_PATH, 'utf8'))
   delete globalThis.window
