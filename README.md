@@ -19,12 +19,15 @@ Three panes:
   the README renders beneath it (through
   [dsh-md-view](https://github.com/joao-paulo-santos/dsh-md-view)), with
   relative links and images resolved against the repo, silent when absent.
-- **Pending**: the GitHub Desktop surface. Uncommitted work grouped
-  Staged/Unstaged/Untracked; per-file checkboxes stage and unstage
-  immediately (the git index is the source of truth); per-hunk checkboxes
-  apply single hunks to the index; a Split/Unified toggle renders each
-  hunk through [dsh-diff-view](https://github.com/joao-paulo-santos/dsh-diff-view);
-  the commit box commits exactly what is staged. Never amends, pushes, or
+- **Pending**: the GitHub Desktop surface, side by side: the file list and
+  commit box on the left, the selected file's diff on the right, always
+  visible together. Files are grouped Staged/Unstaged/Untracked; per-file
+  checkboxes stage and unstage immediately (the git index is the source of
+  truth). In the diff, each hunk carries a checkbox that applies the whole
+  hunk to the index, and clicking any single + or - line stages or unstages
+  exactly that line. Split/Unified toggle renders hunks through
+  [dsh-diff-view](https://github.com/joao-paulo-santos/dsh-diff-view); the
+  commit box commits exactly what is staged. Never amends, pushes, or
   touches history.
 - **History**: the checked-out branch's history, newest first, paginated.
   Picking a commit shows its full message, +/− stats, and every changed

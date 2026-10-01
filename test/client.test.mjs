@@ -336,9 +336,10 @@ test('pending lifecycle: status, whole-file stage, hunk stage, untracked, commit
   git('config', 'user.email', 't@t'); git('config', 'user.name', 'T')
   writeFileSync(pathJoin(dir, 'code.js'), lines.join('\n') + '\n')
   git('add', '-A'); git('commit', '-qm', 'base')
-  // two distant edits = two hunks; one untracked file
+  // adjacent edits (lines 1-2, one hunk with two changed lines) + one
+  // distant edit (line 18, second hunk) + one untracked file
   writeFileSync(pathJoin(dir, 'code.js'),
-    lines.map((l, i) => (i === 0 ? 'HEAD EDIT' : i === 17 ? 'TAIL EDIT' : l)).join('\n') + '\n')
+    lines.map((l, i) => (i === 0 ? 'HEAD EDIT' : i === 1 ? 'SECOND EDIT' : i === 17 ? 'TAIL EDIT' : l)).join('\n') + '\n')
   writeFileSync(pathJoin(dir, 'new.txt'), 'fresh\ncontent\n')
   try {
     let pending = await h.get('/wo-github/pending?path=' + encodeURIComponent(dir))
@@ -361,34 +362,45 @@ test('pending lifecycle: status, whole-file stage, hunk stage, untracked, commit
     const staged = await h.post('/wo-github/pending-stage', { path: dir, file: 'new.txt', stage: true })
     assert.equal(staged.body.files.find((f) => f.file === 'new.txt').staged, true)
 
-    // hunk staging: stage only the FIRST hunk of code.js
+    // LINE-level staging: stage only the FIRST changed line of hunk 1
+    // (the same patch the client's partialHunkPatch builds on line click).
     const codeDiff = await h.get('/wo-github/pending-diff?path=' + encodeURIComponent(dir) + '&file=code.js')
     const text = codeDiff.body.unstaged
     assert.equal(text.split('\n').filter((l) => l.startsWith('@@')).length, 2, 'two hunks in the worktree diff')
     const firstAt = text.indexOf('@@')
     const secondAt = text.indexOf('\n@@', firstAt + 2)
-    const patch = text.slice(0, secondAt + 1)
-    assert.match(patch, /^diff --git /)
-    assert.equal(patch.split('\n').filter((l) => l.startsWith('@@')).length, 1, 'the excerpt carries exactly one hunk')
+    const hunk1 = text.slice(firstAt, secondAt + 1).split('\n')
+    const head = hunk1[0]
+    const body = hunk1.slice(1).filter((l) => l !== '')
+    const plusAt = body.findIndex((l) => l.startsWith('+'))
+    const partialBody = body.map((l, i) => {
+      if (l.startsWith('+')) return i === plusAt ? l : null
+      if (l.startsWith('-')) return i === plusAt ? l : ' ' + l.slice(1)
+      return l
+    }).filter((l) => l !== null)
+    const partial = text.slice(0, firstAt) + head + '\n' + partialBody.join('\n') + '\n'
+    assert.match(partial, /^diff --git /)
+    assert.match(partial, /\+HEAD EDIT/)
+    assert.doesNotMatch(partial, /\+SECOND EDIT/)
 
-    const hunkStaged = await h.post('/wo-github/pending-stage-hunk', { path: dir, patch })
-    const codeRow = hunkStaged.body.files.find((f) => f.file === 'code.js')
-    assert.equal(codeRow.staged, true, 'file reports staged after a hunk lands in the index')
-    assert.equal(codeRow.unstaged, true, 'the second hunk is still unstaged')
+    const lineStaged = await h.post('/wo-github/pending-stage-hunk', { path: dir, patch: partial })
+    const codeRow = lineStaged.body.files.find((f) => f.file === 'code.js')
+    assert.equal(codeRow.staged, true, 'file reports staged after one line lands in the index')
+    assert.equal(codeRow.unstaged, true, 'the rest is still unstaged')
 
-    const afterHunk = await h.get('/wo-github/pending-diff?path=' + encodeURIComponent(dir) + '&file=code.js')
-    assert.match(afterHunk.body.staged, /HEAD EDIT/, 'the staged side holds the head hunk')
-    assert.doesNotMatch(afterHunk.body.staged, /TAIL EDIT/)
-    assert.match(afterHunk.body.unstaged, /TAIL EDIT/, 'the unstaged side still holds the tail hunk')
-    assert.doesNotMatch(afterHunk.body.unstaged, /HEAD EDIT/)
+    const afterLine = await h.get('/wo-github/pending-diff?path=' + encodeURIComponent(dir) + '&file=code.js')
+    assert.match(afterLine.body.staged, /\+HEAD EDIT/, 'exactly the clicked line is staged')
+    assert.doesNotMatch(afterLine.body.staged, /SECOND EDIT/, 'the sibling line is NOT staged')
+    assert.match(afterLine.body.unstaged, /SECOND EDIT/, 'the sibling line remains unstaged')
+    assert.match(afterLine.body.unstaged, /TAIL EDIT/, 'the tail hunk remains unstaged')
 
-    // commit exactly the index (new.txt + code.js's first hunk)
-    const committed = await h.post('/wo-github/pending-commit', { path: dir, summary: 'partial stage commit' })
+    // commit exactly the index (new.txt + the single staged line)
+    const committed = await h.post('/wo-github/pending-commit', { path: dir, summary: 'line stage commit' })
     assert.equal(committed.body.committed, true)
 
     const after = await h.get('/wo-github/pending?path=' + encodeURIComponent(dir))
     const rows = after.body.files
-    assert.equal(rows.length, 1, 'only the remaining unstaged hunk of code.js is pending')
+    assert.equal(rows.length, 1, 'only the remaining unstaged changes of code.js are pending')
     assert.equal(rows[0].file, 'code.js')
     assert.equal(rows[0].staged, false)
   } finally {
@@ -733,6 +745,89 @@ test('client PendingPane: groups, row checkbox, disabled commit without stages',
     const commitBtn = flatten(tree).find((n) => n.type === 'button' && textOf(n).startsWith('Commit'))
     assert.ok(commitBtn !== undefined, 'commit button rendered')
     assert.equal(commitBtn.props.disabled, true, 'empty summary keeps commit disabled')
+  } finally {
+    globalThis.fetch = savedFetch
+    for (const fn of unmounts.splice(0)) { try { fn() } catch (e) {} }
+    delete globalThis.window
+  }
+})
+
+test('partialHunkPatch: one selected line; sibling deletions become context, sibling additions drop', () => {
+  const mod = loadClient()
+  const { partialHunkPatch } = mod._internal
+  const hunk = {
+    head: '@@ -1,5 +1,5 @@',
+    lines: [' keep', '-drop me', '-keep me', '+added pick', '+skip me', ' tail'],
+  }
+  // Select '+added pick' (src index 3): unselected deletions stay in the
+  // index as context; the unselected addition is omitted entirely.
+  const patch = partialHunkPatch(hunk, 3)
+  assert.equal(patch, '@@ -1,5 +1,5 @@\n keep\n drop me\n keep me\n+added pick\n tail\n')
+})
+
+test('PendingPane layout: side-by-side list and diff; first file auto-selected', async () => {
+  const effects = []
+  let hookIdx = 0
+  const slots = []
+  const react = {
+    createElement: (t, p, ...c) => ({ type: t, props: p, children: c.flat(Infinity) }),
+    Fragment: 'F',
+    useState: (initial) => {
+      const i = hookIdx++
+      if (!(i in slots)) slots[i] = typeof initial === 'function' ? initial() : initial
+      return [slots[i], (v) => { slots[i] = typeof v === 'function' ? v(slots[i]) : v }]
+    },
+    useEffect: (fn) => { effects.push(fn) },
+  }
+  let mod
+  globalThis.window = {
+    __ModuleLoader__: { load: (h) => { mod = h.factory((s) => {
+      if (s === 'react') return react
+      if (s === '@deepseek-ai/dsh-client-ui-primitives') return PRIMITIVES_FAKE
+      throw new Error('unexpected require: ' + s)
+    }) } },
+    addEventListener: () => {}, removeEventListener: () => {},
+  }
+  globalThis.document = mkDocument()
+  ;(0, eval)(readFileSync(CLIENT_BUNDLE_PATH, 'utf8'))
+  const savedFetch = globalThis.fetch
+  const unmounts = []
+  const flush = async () => {
+    for (let round = 0; round < 4; round++) {
+      for (const fn of effects.splice(0)) {
+        const r = fn()
+        if (r && typeof r.then === 'function') await r
+        else if (typeof r === 'function') unmounts.push(r)
+      }
+      await new Promise((r) => setTimeout(r, 2))
+    }
+  }
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url).startsWith('/wo-github/pending?')) {
+        return { ok: true, json: async () => ({ count: 2, files: [
+          { file: 'alpha.txt', staged: true, unstaged: false, untracked: false, status: 'M' },
+          { file: 'beta.txt', staged: false, unstaged: true, untracked: false, status: 'M' },
+        ] }) }
+      }
+      return { ok: false, json: async () => ({}) }
+    }
+    const renderPane = (props) => { hookIdx = 0; return mod._internal.PendingPane(props) }
+    renderPane({ loc: { path: '/w/repo' } })
+    await flush()
+    const resolve = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object') return node
+      if (typeof node.type === 'function') return resolve(node.type({ ...node.props, children: node.children }))
+      return { ...node, children: (node.children ?? []).map(resolve) }
+    }
+    const tree = resolve(renderPane({ loc: { path: '/w/repo' } }))
+    const byClass = (cls) => flatten(tree).filter((n) => typeof n.props?.className === 'string' && n.props.className.split(' ').includes(cls))
+    assert.equal(byClass('wog-pending-layout').length, 1, 'the two-pane layout renders')
+    assert.equal(byClass('wog-pending-side').length, 1, 'the list side renders')
+    assert.equal(byClass('wog-pending-main').length, 1, 'the diff side renders alongside the list')
+    const active = byClass('wog-pendingrow-active')
+    assert.equal(active.length, 1, 'exactly one selected row')
+    assert.ok(textOf(active[0]).includes('alpha.txt'), 'the first file is auto-selected')
   } finally {
     globalThis.fetch = savedFetch
     for (const fn of unmounts.splice(0)) { try { fn() } catch (e) {} }
