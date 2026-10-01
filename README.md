@@ -5,6 +5,12 @@ plugin: a GitHub subtab in the Workspace Overview tab, presenting the
 current workspace's repository as if you were on the site. Local first:
 commits, diffs, and the README come from the workspace's own clone.
 
+Also adds a BRANCH PILL to the composer's left row (beside the persona
+picker): the GitHub mark plus the workspace's checked-out branch, polled
+live so agent checkouts update it. Hidden outside a git repo; a detached
+HEAD shows the short sha; with a github.com remote the pill links to the
+branch's tree.
+
 Three panes:
 
 - **Overview**: the About card: description, topics, stars/watchers/

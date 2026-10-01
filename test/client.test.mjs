@@ -86,7 +86,7 @@ const loadClient = () => {
 test('client registers the github subtab with the workspaceOverview facade', () => {
   const mod = loadClient()
   assert.equal(mod.name, 'wo-github-client')
-  assert.deepEqual(mod.inject, ['workspaceOverview'])
+  assert.deepEqual(mod.inject, ['workspaceOverview', 'slots'])
   const registered = []
   const off = { called: false }
   const overview = { registerTab: (options, component) => { registered.push({ options, component }); return () => { off.called = true } } }
@@ -96,6 +96,7 @@ test('client registers the github subtab with the workspaceOverview facade', () 
     get: (n) => (mod.inject.includes(n) ? provided[n] : undefined),
     provide: (n, a) => { provided[n] = a },
     workspaceOverview: overview,
+    slots: { inject: (seat, fn) => { fn(); return () => {} }, register: (o, c) => c },
   }
   const dispose = mod.apply(ctx)
   assert.equal(registered.length, 1)
@@ -402,7 +403,7 @@ test('CommitsPane: hook count is stable across selection (React #300 regression)
   globalThis.document = mkDocument()
   ;(0, eval)(readFileSync(CLIENT_BUNDLE_PATH, 'utf8'))
   delete globalThis.window
-  mod.apply({ inject: mod.inject, workspaceOverview: { registerTab: () => () => {} }, get: () => undefined, provide: () => {} })
+  mod.apply({ inject: mod.inject, workspaceOverview: { registerTab: () => () => {} }, slots: { inject: (seat, fn) => { fn(); return () => {} }, register: (o, c) => c }, get: () => undefined, provide: () => {} })
   const CommitsPane = mod._internal.CommitsPane
   const loc = { path: '/tmp', repo: undefined }
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ source: 'local', hasMore: false, commits: [{ sha: 'abc1234', message: 'm', author: 'A', date: '2026-01-01T00:00:00Z' }] }) })
@@ -417,4 +418,128 @@ test('CommitsPane: hook count is stable across selection (React #300 regression)
   CommitsPane({ loc })
   const afterSelection = counts[1]
   assert.equal(afterSelection, beforeSelection, 'selection must not change the hook count (early return before hooks = React #300)')
+})
+
+// ------------------------------------------------- branch pill (host + client)
+
+const mkRepo = () => {
+  const dir = mkdtempSync(pathJoin(tmpdir(), 'wogbranch-'))
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], {
+    env: { ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' },
+  })
+  git('init', '-b', 'main')
+  writeFileSync(pathJoin(dir, 'a.txt'), 'one\n')
+  git('add', '.')
+  git('commit', '-m', 'c1')
+  return { dir, git, cleanup: () => { try { rmSync(dir, { recursive: true, force: true }) } catch (e) {} } }
+}
+
+test('host branch route: branch, agent checkout, detached, non-repo', async () => {
+  const h = mkHostHarness()
+  const host = await import(HOST_ENTRY_PATH)
+  host.apply({ webServer: { register: (s) => { h.routes.set(s.path, s.handler); return () => {} } } })
+  const repo = mkRepo()
+  try {
+    const onMain = await h.get('/wo-github/branch?path=' + encodeURIComponent(repo.dir))
+    assert.equal(onMain.status, 200)
+    assert.equal(onMain.body.branch, 'main')
+    assert.equal(onMain.body.sha, null)
+
+    // the agent checks out a new branch: the pill's next poll sees it
+    repo.git('checkout', '-b', 'feature/x')
+    const onFeature = await h.get('/wo-github/branch?path=' + encodeURIComponent(repo.dir))
+    assert.equal(onFeature.body.branch, 'feature/x')
+
+    // detached HEAD: branch null, short sha present
+    repo.git('checkout', '--detach', 'HEAD')
+    const onDetached = await h.get('/wo-github/branch?path=' + encodeURIComponent(repo.dir))
+    assert.equal(onDetached.body.branch, null)
+    assert.match(onDetached.body.sha, /^[0-9a-f]{7,}$/)
+
+    const emptyDir = mkdtempSync(pathJoin(tmpdir(), 'wogbranchnone-'))
+    try {
+      const notRepo = await h.get('/wo-github/branch?path=' + encodeURIComponent(emptyDir))
+      assert.equal(notRepo.status, 200)
+      assert.equal(notRepo.body.branch, null)
+      assert.equal(notRepo.body.sha, null)
+    } finally { rmSync(emptyDir, { recursive: true, force: true }) }
+  } finally {
+    repo.cleanup()
+  }
+})
+
+test('client BranchPill: shows the branch with slug link, hides without a repo', async () => {
+  // A loader whose fake React COLLECTS effects so the pill's fetch runs.
+  const effects = []
+  const react = {
+    createElement: (t, p, ...c) => ({ type: t, props: p, children: c.flat(Infinity) }),
+    Fragment: 'F',
+    useState: (initial) => [typeof initial === 'function' ? initial() : initial, (v) => {}],
+    useEffect: (fn) => { effects.push(fn) },
+  }
+  let mod
+  globalThis.window = {
+    __ModuleLoader__: {
+      load: (h) => {
+        mod = h.factory((s) => {
+          if (s === 'react') return react
+          if (s === '@deepseek-ai/dsh-client-ui-primitives') return PRIMITIVES_FAKE
+          throw new Error('unexpected require: ' + s)
+        })
+      },
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }
+  globalThis.document = mkDocument()
+  ;(0, eval)(readFileSync(CLIENT_BUNDLE_PATH, 'utf8'))
+  const { BranchPill } = mod._internal
+  const savedFetch = globalThis.fetch
+  const mkProps = (cwd) => ({
+    sessionId: 's1',
+    useSessions: (sel) => sel({ current: 's1', byId: { s1: { cwd } } }),
+  })
+  const flush = async () => {
+    const cleanups = []
+    for (let round = 0; round < 4; round++) {
+      const pending = effects.splice(0)
+      for (const fn of pending) {
+        const r = fn()
+        if (r && typeof r.then === 'function') await r
+        else if (typeof r === 'function') cleanups.push(r)
+      }
+      await new Promise((r) => setTimeout(r, 2))
+    }
+    return () => { for (const fn of cleanups) { try { fn() } catch (e) {} } }
+  }
+  try {
+    // First mount runs the poll effect; the fake React's state is frozen, so
+    // assert against the module cache the effect fills: a remount reads it.
+    globalThis.fetch = async (url) => {
+      const u = String(url)
+      if (u.startsWith('/wo-github/branch')) return { ok: true, json: async () => ({ branch: 'feature/x', sha: null }) }
+      if (u.startsWith('/wo-github/locate')) return { ok: true, json: async () => ({ git: true, slug: 'o/r' }) }
+      return { ok: false, json: async () => ({}) }
+    }
+    BranchPill(mkProps('/w/repo'))
+    const unmountRepo = await flush()
+    const tree = BranchPill(mkProps('/w/repo'))
+    const texts = flatten(tree).map(textOf)
+    assert.ok(texts.includes('feature/x'), 'branch label rendered')
+    const anchor = flatten(tree).find((n) => n.type === 'a')
+    assert.ok(anchor !== undefined, 'pill links to the branch tree')
+    assert.equal(anchor.props.href, 'https://github.com/o/r/tree/feature/x')
+    unmountRepo()
+
+    // no repo: the pill renders nothing
+    effects.length = 0
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ branch: null, sha: null }) })
+    BranchPill(mkProps('/w/plain'))
+    const unmountPlain = await flush()
+    assert.equal(BranchPill(mkProps('/w/plain')), null)
+    unmountPlain()
+  } finally {
+    globalThis.fetch = savedFetch
+    delete globalThis.window
+  }
 })
