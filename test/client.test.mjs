@@ -803,6 +803,22 @@ test('PendingPane layout: side-by-side list and diff; first file auto-selected',
     }
   }
   try {
+    // A fake diffView whose component READS hunk.lines: passing the parser's
+    // rows-shaped hunks (the live #2 crash) throws here instead.
+    const fakeDiffView = {
+      diffFileComponent: () => (props) => ({
+        type: 'div',
+        props: { className: 'fakediff', 'data-mode': props.mode },
+        children: (props.hunks ?? []).flatMap((h) => h.lines.map((l) => l.slice(1))),
+      }),
+    }
+    mod.apply({
+      inject: mod.inject,
+      workspaceOverview: { registerTab: () => () => {} },
+      slots: { inject: (seat, fn) => { fn(); return () => {} }, register: (o, c) => c },
+      get: (n) => (n === 'diffView' ? fakeDiffView : undefined),
+      provide: () => {},
+    })
     globalThis.fetch = async (url) => {
       if (String(url).startsWith('/wo-github/pending?')) {
         return { ok: true, json: async () => ({ count: 2, files: [
@@ -810,16 +826,24 @@ test('PendingPane layout: side-by-side list and diff; first file auto-selected',
           { file: 'beta.txt', staged: false, unstaged: true, untracked: false, status: 'M' },
         ] }) }
       }
+      if (String(url).startsWith('/wo-github/pending-diff?')) {
+        return { ok: true, json: async () => ({
+          staged: 'diff --git a/alpha.txt b/alpha.txt\nindex 111..222 100644\n--- a/alpha.txt\n+++ b/alpha.txt\n@@ -1,2 +1,2 @@\n context\n-old alpha\n+new alpha\n',
+          unstaged: 'diff --git a/alpha.txt b/alpha.txt\nindex 222..333 100644\n--- a/alpha.txt\n+++ b/alpha.txt\n@@ -9,1 +9,1 @@\n tail ctx\n-old tail\n+new tail\n',
+        }) }
+      }
       return { ok: false, json: async () => ({}) }
     }
     const renderPane = (props) => { hookIdx = 0; return mod._internal.PendingPane(props) }
-    renderPane({ loc: { path: '/w/repo' } })
-    await flush()
     const resolve = (node) => {
       if (node === null || node === undefined || typeof node !== 'object') return node
       if (typeof node.type === 'function') return resolve(node.type({ ...node.props, children: node.children }))
       return { ...node, children: (node.children ?? []).map(resolve) }
     }
+    renderPane({ loc: { path: '/w/repo' } })
+    await flush()                                   // list ready
+    resolve(renderPane({ loc: { path: '/w/repo' } }))   // mounts PendingFile (registers its fetch)
+    await flush()                                   // diff lands in PendingFile's state
     const tree = resolve(renderPane({ loc: { path: '/w/repo' } }))
     const byClass = (cls) => flatten(tree).filter((n) => typeof n.props?.className === 'string' && n.props.className.split(' ').includes(cls))
     assert.equal(byClass('wog-pending-layout').length, 1, 'the two-pane layout renders')
@@ -828,6 +852,11 @@ test('PendingPane layout: side-by-side list and diff; first file auto-selected',
     const active = byClass('wog-pendingrow-active')
     assert.equal(active.length, 1, 'exactly one selected row')
     assert.ok(textOf(active[0]).includes('alpha.txt'), 'the first file is auto-selected')
+    const texts = flatten(tree).map(textOf)
+    assert.ok(texts.some((t) => t.includes('new alpha')), 'the staged hunk renders through the diff component')
+    assert.ok(texts.some((t) => t.includes('new tail')), 'the unstaged hunk renders through the diff component')
+    assert.ok(texts.some((t) => t.includes('Staged changes')), 'the staged section is titled')
+    assert.ok(texts.some((t) => t.includes('Unstaged changes')), 'the unstaged section is titled')
   } finally {
     globalThis.fetch = savedFetch
     for (const fn of unmounts.splice(0)) { try { fn() } catch (e) {} }
