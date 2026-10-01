@@ -11,13 +11,13 @@ live so agent checkouts update it. Hidden outside a git repo; a detached
 HEAD shows the short sha; with a github.com remote the pill links to the
 branch's tree.
 
-Three panes:
+Two panes:
 
 - **Overview**: the About card: description, topics, stars/watchers/
-  forks/issues, language, license, default branch, homepage, last push.
-- **README**: the repository README rendered as markdown (through
+  forks/issues, language, license, default branch, homepage, last push;
+  the README renders beneath it (through
   [dsh-md-view](https://github.com/joao-paulo-santos/dsh-md-view)), with
-  relative links and images resolved against the repo.
+  relative links and images resolved against the repo, silent when absent.
 - **Commits**: the checked-out branch's history, newest first, paginated.
   Picking a commit shows its full message, +/− stats, and every changed
   file as a unified patch with true line numbers; word-level highlights
