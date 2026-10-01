@@ -32,7 +32,25 @@ const fakeRelativeTime = (at, now) => {
   if (diff < 365 * DAY) return { unit: 'months', n: Math.floor(diff / (30 * DAY)) }
   return { unit: 'years', n: Math.floor(diff / (365 * DAY)) }
 }
-const PRIMITIVES_FAKE = { relativeTime: fakeRelativeTime }
+// Minimal stand-ins matching the primitive contracts the plugin uses.
+const PRIMITIVES_FAKE = {
+  relativeTime: fakeRelativeTime,
+  Button: (props) => ({ type: 'button', props, children: [props.children].flat(Infinity) }),
+  Checkbox: (props) => ({
+    type: 'label',
+    props: { className: props.className, title: props.title },
+    children: [
+      { type: 'input', props: { type: 'checkbox', checked: props.checked, disabled: props.disabled }, children: [] },
+      { type: 'span', props: {}, children: [props.label] },
+    ],
+  }),
+  Input: (props) => ({ type: 'input', props, children: [] }),
+  SegmentedControl: (props) => ({
+    type: 'div',
+    props: { role: 'tablist', 'aria-label': props.label },
+    children: props.options.map((o) => ({ type: 'button', props: { key: o.value, onClick: () => { props.onChange(o.value) } }, children: [o.label] })),
+  }),
+}
 const HOST_ENTRY_PATH = pathResolve(HERE, '../lib/index.js')
 
 // ---------------------------------------------------------------- client
@@ -167,19 +185,37 @@ const mkHostHarness = () => {
   const ctx = { webServer }
   const calls = []
   const savedFetch = globalThis.fetch
+  const mkRes = () => {
+    const res = { statusCode: 0, headers: {}, body: '' }
+    return {
+      res,
+      set statusCode(v) { res.statusCode = v },
+      get statusCode() { return res.statusCode },
+      setHeader(k, v) { res.headers[k] = v },
+      end(b) { res.body = b },
+    }
+  }
   return {
     routes, calls,
     setFetch(fn) { globalThis.fetch = async (url, init) => { calls.push({ url, init }); return fn(url, init) } },
     async get(path) {
-      const res = { statusCode: 0, headers: {}, body: '' }
-      await routes.get(new URL(path, 'http://localhost').pathname)(
-        { url: path }, {
-          set statusCode(v) { res.statusCode = v },
-          get statusCode() { return res.statusCode },
-          setHeader(k, v) { res.headers[k] = v },
-          end(b) { res.body = b },
-        })
-      return { status: res.statusCode, body: JSON.parse(res.body) }
+      const res = mkRes()
+      await routes.get(new URL(path, 'http://localhost').pathname)({ url: path, method: 'GET' }, res)
+      return { status: res.res.statusCode, body: JSON.parse(res.res.body) }
+    },
+    async post(path, body) {
+      const res = mkRes()
+      const listeners = {}
+      const req = {
+        method: 'POST', url: path,
+        on: (event, fn) => { listeners[event] = fn },
+        destroy: () => {},
+      }
+      const pending = routes.get(new URL(path, 'http://localhost').pathname)(req, res)
+      if (listeners.data !== undefined) listeners.data(Buffer.from(JSON.stringify(body)))
+      if (listeners.end !== undefined) listeners.end()
+      await pending
+      return { status: res.res.statusCode, body: JSON.parse(res.res.body) }
     },
     cleanup() { globalThis.fetch = savedFetch },
   }
@@ -286,6 +322,79 @@ const mkFixtureRepo = () => {
   git('add', '-A'); git('commit', '-m', 'second: add code\n\nbody line')
   return dir
 }
+
+test('pending lifecycle: status, whole-file stage, hunk stage, untracked, commit', async () => {
+  const h = mkHostHarness()
+  const host = await import(HOST_ENTRY_PATH)
+  host.apply({ webServer: { register: (s) => { h.routes.set(s.path, s.handler); return () => {} } } })
+  const dir = mkdtempSync(pathJoin(tmpdir(), 'wogpend-'))
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], {
+    env: { ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' },
+  })
+  const lines = Array.from({ length: 20 }, (_, i) => 'line ' + (i + 1))
+  git('init', '-q', '-b', 'main', '.')
+  git('config', 'user.email', 't@t'); git('config', 'user.name', 'T')
+  writeFileSync(pathJoin(dir, 'code.js'), lines.join('\n') + '\n')
+  git('add', '-A'); git('commit', '-qm', 'base')
+  // two distant edits = two hunks; one untracked file
+  writeFileSync(pathJoin(dir, 'code.js'),
+    lines.map((l, i) => (i === 0 ? 'HEAD EDIT' : i === 17 ? 'TAIL EDIT' : l)).join('\n') + '\n')
+  writeFileSync(pathJoin(dir, 'new.txt'), 'fresh\ncontent\n')
+  try {
+    let pending = await h.get('/wo-github/pending?path=' + encodeURIComponent(dir))
+    assert.equal(pending.status, 200)
+    assert.equal(pending.body.count, 2)
+    const code = pending.body.files.find((f) => f.file === 'code.js')
+    const fresh = pending.body.files.find((f) => f.file === 'new.txt')
+    assert.equal(code.staged, false, 'modification starts unstaged')
+    assert.equal(fresh.untracked, true)
+
+    // branch route carries the dirty count
+    const branch = await h.get('/wo-github/branch?path=' + encodeURIComponent(dir))
+    assert.equal(branch.body.pending, 2)
+
+    // untracked file's diff comes back as whole-file additions (before staging)
+    const untrackedDiff = await h.get('/wo-github/pending-diff?path=' + encodeURIComponent(dir) + '&file=new.txt')
+    assert.equal(untrackedDiff.body.untrackedText, 'fresh\ncontent\n')
+
+    // whole-file stage of the untracked file
+    const staged = await h.post('/wo-github/pending-stage', { path: dir, file: 'new.txt', stage: true })
+    assert.equal(staged.body.files.find((f) => f.file === 'new.txt').staged, true)
+
+    // hunk staging: stage only the FIRST hunk of code.js
+    const codeDiff = await h.get('/wo-github/pending-diff?path=' + encodeURIComponent(dir) + '&file=code.js')
+    const text = codeDiff.body.unstaged
+    assert.equal(text.split('\n').filter((l) => l.startsWith('@@')).length, 2, 'two hunks in the worktree diff')
+    const firstAt = text.indexOf('@@')
+    const secondAt = text.indexOf('\n@@', firstAt + 2)
+    const patch = text.slice(0, secondAt + 1)
+    assert.match(patch, /^diff --git /)
+    assert.equal(patch.split('\n').filter((l) => l.startsWith('@@')).length, 1, 'the excerpt carries exactly one hunk')
+
+    const hunkStaged = await h.post('/wo-github/pending-stage-hunk', { path: dir, patch })
+    const codeRow = hunkStaged.body.files.find((f) => f.file === 'code.js')
+    assert.equal(codeRow.staged, true, 'file reports staged after a hunk lands in the index')
+    assert.equal(codeRow.unstaged, true, 'the second hunk is still unstaged')
+
+    const afterHunk = await h.get('/wo-github/pending-diff?path=' + encodeURIComponent(dir) + '&file=code.js')
+    assert.match(afterHunk.body.staged, /HEAD EDIT/, 'the staged side holds the head hunk')
+    assert.doesNotMatch(afterHunk.body.staged, /TAIL EDIT/)
+    assert.match(afterHunk.body.unstaged, /TAIL EDIT/, 'the unstaged side still holds the tail hunk')
+    assert.doesNotMatch(afterHunk.body.unstaged, /HEAD EDIT/)
+
+    // commit exactly the index (new.txt + code.js's first hunk)
+    const committed = await h.post('/wo-github/pending-commit', { path: dir, summary: 'partial stage commit' })
+    assert.equal(committed.body.committed, true)
+
+    const after = await h.get('/wo-github/pending?path=' + encodeURIComponent(dir))
+    const rows = after.body.files
+    assert.equal(rows.length, 1, 'only the remaining unstaged hunk of code.js is pending')
+    assert.equal(rows[0].file, 'code.js')
+    assert.equal(rows[0].staged, false)
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }) } catch (e) {}
+  }
+})
 
 test('local: locate, readme, commits, commit detail, meta — no network', async () => {
   const dir = mkFixtureRepo()
@@ -517,7 +626,7 @@ test('client BranchPill: shows the branch with slug link, hides without a repo',
     // assert against the module cache the effect fills: a remount reads it.
     globalThis.fetch = async (url) => {
       const u = String(url)
-      if (u.startsWith('/wo-github/branch')) return { ok: true, json: async () => ({ branch: 'feature/x', sha: null }) }
+      if (u.startsWith('/wo-github/branch')) return { ok: true, json: async () => ({ branch: 'feature/x', sha: null, pending: 3 }) }
       if (u.startsWith('/wo-github/locate')) return { ok: true, json: async () => ({ git: true, slug: 'o/r' }) }
       return { ok: false, json: async () => ({}) }
     }
@@ -526,10 +635,11 @@ test('client BranchPill: shows the branch with slug link, hides without a repo',
     const tree = BranchPill(mkProps('/w/repo'))
     const texts = flatten(tree).map(textOf)
     assert.ok(texts.includes('feature/x'), 'branch label rendered')
+    const badge = flatten(tree).find((n) => typeof n.props?.className === 'string' && n.props.className.split(' ').includes('wog-branchpill-badge'))
+    assert.equal(badge !== undefined && textOf(badge), '3', 'pending count badge rendered')
     const anchor = flatten(tree).find((n) => n.type === 'a')
     assert.ok(anchor !== undefined, 'pill links to the branch tree')
     assert.equal(anchor.props.href, 'https://github.com/o/r/tree/feature/x')
-    unmountRepo()
 
     // no repo: the pill renders nothing
     effects.length = 0
@@ -537,9 +647,95 @@ test('client BranchPill: shows the branch with slug link, hides without a repo',
     BranchPill(mkProps('/w/plain'))
     const unmountPlain = await flush()
     assert.equal(BranchPill(mkProps('/w/plain')), null)
+    unmountRepo()
     unmountPlain()
   } finally {
     globalThis.fetch = savedFetch
+    try { unmountRepo !== undefined && unmountRepo() } catch (e) {}
+    try { unmountPlain !== undefined && unmountPlain() } catch (e) {}
+    delete globalThis.window
+  }
+})
+
+test('client PendingPane: groups, row checkbox, disabled commit without stages', async () => {
+  const effects = []
+  const unmounts = []
+  // Stateful fake React: slots persist across renders so the pane's fetch
+  // lands in state and the NEXT render shows the ready view.
+  let hookIdx = 0
+  const slots = []
+  const react = {
+    createElement: (t, p, ...c) => ({ type: t, props: p, children: c.flat(Infinity) }),
+    Fragment: 'F',
+    useState: (initial) => {
+      const i = hookIdx++
+      if (!(i in slots)) slots[i] = typeof initial === 'function' ? initial() : initial
+      return [slots[i], (v) => { slots[i] = typeof v === 'function' ? v(slots[i]) : v }]
+    },
+    useEffect: (fn) => { effects.push(fn) },
+  }
+  const renderPane = (props) => { hookIdx = 0; return mod._internal.PendingPane(props) }
+  let mod
+  globalThis.window = {
+    __ModuleLoader__: {
+      load: (h) => {
+        mod = h.factory((s) => {
+          if (s === 'react') return react
+          if (s === '@deepseek-ai/dsh-client-ui-primitives') return PRIMITIVES_FAKE
+          throw new Error('unexpected require: ' + s)
+        })
+      },
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }
+  globalThis.document = mkDocument()
+  ;(0, eval)(readFileSync(CLIENT_BUNDLE_PATH, 'utf8'))
+  const savedFetch = globalThis.fetch
+  const flush = async () => {
+    for (let round = 0; round < 4; round++) {
+      for (const fn of effects.splice(0)) {
+        const r = fn()
+        if (r && typeof r.then === 'function') await r
+        else if (typeof r === 'function') unmounts.push(r)
+      }
+      await new Promise((r) => setTimeout(r, 2))
+    }
+  }
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url).startsWith('/wo-github/pending?')) {
+        return { ok: true, json: async () => ({
+          count: 2,
+          files: [
+            { file: 'staged.txt', staged: true, unstaged: false, untracked: false, status: 'M', stagedCounts: { additions: 2, deletions: 1 } },
+            { file: 'dirty.txt', staged: false, unstaged: true, untracked: false, status: 'M', unstagedCounts: { additions: 5, deletions: 0 } },
+          ],
+        }) }
+      }
+      return { ok: false, json: async () => ({}) }
+    }
+    // Mini-React never executes function-typed elements; resolve them so the
+    // primitive fakes (Checkbox, Button) actually render.
+    const resolve = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object') return node
+      if (typeof node.type === 'function') return resolve(node.type({ ...node.props, children: node.children }))
+      return { ...node, children: (node.children ?? []).map(resolve) }
+    }
+    renderPane({ loc: { path: '/w/repo' } })
+    await flush()
+    const tree = resolve(renderPane({ loc: { path: '/w/repo' } }))
+    const texts = flatten(tree).map(textOf)
+    assert.ok(texts.some((t) => t.includes('Staged')), 'staged group present')
+    assert.ok(texts.some((t) => t.includes('Unstaged')), 'unstaged group present')
+    assert.ok(texts.includes('staged.txt') && texts.includes('dirty.txt'), 'file rows rendered')
+    // one file staged, but the empty summary keeps Commit disabled
+    const commitBtn = flatten(tree).find((n) => n.type === 'button' && textOf(n).startsWith('Commit'))
+    assert.ok(commitBtn !== undefined, 'commit button rendered')
+    assert.equal(commitBtn.props.disabled, true, 'empty summary keeps commit disabled')
+  } finally {
+    globalThis.fetch = savedFetch
+    for (const fn of unmounts.splice(0)) { try { fn() } catch (e) {} }
     delete globalThis.window
   }
 })

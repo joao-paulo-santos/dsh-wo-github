@@ -7,22 +7,29 @@ commits, diffs, and the README come from the workspace's own clone.
 
 Also adds a BRANCH PILL to the composer's left row (beside the persona
 picker): the GitHub mark plus the workspace's checked-out branch, polled
-live so agent checkouts update it. Hidden outside a git repo; a detached
-HEAD shows the short sha; with a github.com remote the pill links to the
+live so agent checkouts update it, with an amber badge counting files
+with uncommitted changes. Hidden outside a git repo; a detached HEAD
+shows the short sha; with a github.com remote the pill links to the
 branch's tree.
 
-Two panes:
+Three panes:
 
 - **Overview**: the About card: description, topics, stars/watchers/
   forks/issues, language, license, default branch, homepage, last push;
   the README renders beneath it (through
   [dsh-md-view](https://github.com/joao-paulo-santos/dsh-md-view)), with
   relative links and images resolved against the repo, silent when absent.
-- **Commits**: the checked-out branch's history, newest first, paginated.
+- **Pending**: the GitHub Desktop surface. Uncommitted work grouped
+  Staged/Unstaged/Untracked; per-file checkboxes stage and unstage
+  immediately (the git index is the source of truth); per-hunk checkboxes
+  apply single hunks to the index; a Split/Unified toggle renders each
+  hunk through [dsh-diff-view](https://github.com/joao-paulo-santos/dsh-diff-view);
+  the commit box commits exactly what is staged. Never amends, pushes, or
+  touches history.
+- **History**: the checked-out branch's history, newest first, paginated.
   Picking a commit shows its full message, +/− stats, and every changed
   file as a unified patch with true line numbers; word-level highlights
-  come from [dsh-diff-view](https://github.com/joao-paulo-santos/dsh-diff-view)
-  when installed.
+  come from dsh-diff-view when installed.
 
 No git clone and no github.com remote? The tab shows a quiet empty state.
 A clone WITHOUT a github.com remote (gitlab, local-only git) still gets
